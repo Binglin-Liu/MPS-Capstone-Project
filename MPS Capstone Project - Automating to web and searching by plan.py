@@ -1,363 +1,260 @@
 #!/usr/bin/env python
-# coding: utf-8
+# -*- coding: utf-8 -*-
 
-# In[1]:
-
+import pandas as pd
+import time
+import re
+from pathlib import Path
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
 
 
-# In[2]:
+# ---------- helpers ----------
+def sanitize_filename(name: str, max_len: int = 120) -> str:
+    name = re.sub(r"\s+", " ", str(name)).strip()
+    name = re.sub(r'[\\/*?:"<>|]', "_", name)
+    return name[:max_len]
 
 
-# Helper function
+def build_search_query(plan_name: str, max_words: int = 8) -> str:
+    s = " ".join(str(plan_name).strip().replace("\xa0", " ").split())
+    s = s.replace("&", " ").replace("(", " ").replace(")", " ").replace(",", " ")
+    s = re.sub(r"\s+", " ", s).strip()
 
-def close_try_later_modal(driver, timeout=5):
+    drop = {
+        "INC", "INC.", "LLC", "L.L.C.", "CO", "CO.", "CORP", "CORPORATION",
+        "LTD", "LIMITED", "TRUST", "PLAN", "PROFIT", "SHARING", "SAVINGS",
+        "RETIREMENT", "EMPLOYEE", "BENEFIT"
+    }
+    words = [w for w in s.split() if w.upper() not in drop]
+    return " ".join(words[:max_words]) if words else s
+
+
+def list_pdfs(folder: Path) -> set[str]:
+    return {p.name for p in folder.glob("*.pdf")}
+
+
+def move_new_pdf(download_dir: Path, before: set[str], target_path: Path) -> bool:
     """
-    Detects the 'Please try back later...' modal and closes it if present.
-    Returns True if modal was found and closed, False otherwise.
+    Wait for a new PDF to appear in download_dir, then rename/move to target_path.
     """
-    try:
-        # Wait to see if modal heading appears
-        modal_heading = WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//span[contains(text(),'Please try back later')]")
+    for _ in range(80):  # ~40s
+        # Chrome uses .crdownload while downloading
+        if any(p.suffix == ".crdownload" for p in download_dir.glob("*.crdownload")):
+            time.sleep(0.5)
+            continue
+
+        after = list_pdfs(download_dir)
+        new_files = list(after - before)
+        if new_files:
+            newest = download_dir / new_files[0]
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path.exists():
+                target_path.unlink()
+            newest.rename(target_path)
+            return True
+
+        time.sleep(0.5)
+
+    return False
+
+
+def clear_plan_name_only(driver, wait, retries=3) -> bool:
+    for attempt in range(retries):
+        try:
+            btn = wait.until(
+                EC.element_to_be_clickable((By.XPATH, "(//button[contains(@class,'breadcrumb-delete-btn')])[2]"))
             )
-        )
+            driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+            driver.execute_script("arguments[0].click();", btn)
+            print("🧹 Cleared plan name (breadcrumb X).")
+            return True
+        except TimeoutException:
+            print(f"⚠️ Attempt {attempt+1}: Plan name breadcrumb X not clickable yet.")
+            time.sleep(0.4)
+    print("❌ Could not clear plan name after retries.")
+    return False
 
-        # Find the modal close button (either 'X' or 'Close')
+
+def close_try_later_modal(driver, timeout=3) -> bool:
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.XPATH, "//span[contains(text(),'Please try back later')]"))
+        )
         close_button = WebDriverWait(driver, timeout).until(
             EC.element_to_be_clickable((
                 By.XPATH,
                 "//button[contains(@class,'usa-modal__close')] | //button[.//span[text()='Close']]"
             ))
         )
-
-        # Click the close button using JavaScript
         driver.execute_script("arguments[0].click();", close_button)
         print("Modal closed automatically.")
         return True
-
     except TimeoutException:
-        # Modal not present
         return False
 
 
-# In[3]:
-
-
-# Setup Chrome WebDriver
-options = webdriver.ChromeOptions()
-options.add_argument("--start-maximized")
-driver = webdriver.Chrome(
-    service=Service(ChromeDriverManager().install()), options=options
-)
-
-# Explicit wait
-wait = WebDriverWait(driver, 20)  # Wait up to 20 seconds for elements
-
-# Open the search page
-driver.get("https://www.efast.dol.gov/5500Search/")
-
-# Step 1: Close modal if it appears
-close_try_later_modal(driver)
-
-# Step 2: Click 'Show Filters'
-wait.until(
-    EC.element_to_be_clickable(
+def apply_year_filter(driver, wait, year: str):
+    wait.until(EC.element_to_be_clickable(
         (By.XPATH, "//button[.//span[normalize-space(text())='Show Filters']]")
-    )
-).click()
+    )).click()
 
-
-# Step 3: Open 'Plan Years' accordion
-wait.until(
-    EC.element_to_be_clickable(
+    wait.until(EC.element_to_be_clickable(
         (By.XPATH, "//button[contains(@class,'filter-category-button') and normalize-space(text())='Plan Years']")
-    )
-).click()
-#
+    )).click()
 
-# Step 4: Select 2024
-wait.until(
-    EC.element_to_be_clickable(
-        (By.XPATH, "//div[@id='planYearList']//a[starts-with(normalize-space(text()), '2024')]")
-    )
-).click()
+    wait.until(EC.element_to_be_clickable(
+        (By.XPATH, f"//div[@id='planYearList']//a[starts-with(normalize-space(text()), '{year}')]")
+    )).click()
 
 
-# In[4]:
-
-
-# # # HELPER FUNCTION TO CLEAR SEARCH BAR BEFORE SEARCHING FOR NEXT PLAN
-
-# def clear_plan_name_only(driver, wait, retries=2):
-#     """
-#     Clears the second breadcrumb X button (Plan Name) robustly.
-#     """
-#     for attempt in range(retries):
-#         try:
-#             # Wait for the second X button to be visible and clickable
-#             plan_name_clear_btn = wait.until(
-#                 EC.element_to_be_clickable((
-#                     By.XPATH,
-#                     "(//button[contains(@class,'breadcrumb-delete-btn')])[2]"
-#                 ))
-#             )
-
-#             # Scroll into view in case it's hidden
-#             driver.execute_script("arguments[0].scrollIntoView(true);", plan_name_clear_btn)
-            
-#             # Click via JS to avoid overlay issues
-#             driver.execute_script("arguments[0].click();", plan_name_clear_btn)
-#             print("🧹 Cleared plan name (second X button).")
-#             return True
-
-#         except TimeoutException:
-#             print(f"⚠️ Attempt {attempt+1}: Plan name breadcrumb X button not clickable yet.")
-#             time.sleep(0.3)  # small delay before retry
-
-#     print("❌ Could not clear plan name after retries.")
-#     return False
-
-
-# In[5]:
-
-
-# wait.until(
-#     EC.element_to_be_clickable(
-#         (By.XPATH, "(//button[contains(@class,'breadcrumb-delete-btn')])[2]")
-#     )
-# ).click()
-
-
-# In[6]:
-
-
-# import pandas as pd
-# import time
-# from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
-# from selenium.webdriver.common.keys import Keys
-# from selenium.webdriver.common.by import By
-# from selenium.webdriver.support import expected_conditions as EC
-
-
-# # Read Excel
-# excel_file = "/Users/sharonzou/f_5500_2024_all.xlsx"
-# df = pd.read_excel(excel_file, nrows=10)
-# plan_names = df['PLAN_NAME'].dropna().tolist()
-
-# for plan in plan_names:
-#     clean_plan = plan.strip().replace("\xa0", " ")
-#     print(f"\n🔍 Searching for: {clean_plan}")
-
-#     # Remove modal if it appears
-#     driver.execute_script("""
-#         const modal = document.querySelector('.mmodal');
-#         if (modal) modal.remove();
-#     """)
-
-#     # Type plan name
-#     search_input = wait.until(EC.element_to_be_clickable((By.ID, "search-field")))
-#     search_input.clear()
-#     search_input.send_keys(clean_plan)
-#     driver.execute_script(
-#         "arguments[0].dispatchEvent(new Event('input', { bubbles: true }))",
-#         search_input
-#     )
-#     time.sleep(0.5)  # debounce
-
-#     # Click Go
-#     go_button = wait.until(
-#         EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='Go!']]"))
-#     )
-#     driver.execute_script("arguments[0].click();", go_button)
-
-#     # Wait and check for the plan robustly
-#     found = False
-#     try:
-#         WebDriverWait(driver, 10).until(
-#             lambda d: any(
-#                 clean_plan.lower() in row.text.lower()
-#                 for row in d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-#             )
-#         )
-#         found = True
-#     except TimeoutException:
-#         found = False
-#     except StaleElementReferenceException:
-#         # Retry once if stale
-#         try:
-#             WebDriverWait(driver, 5).until(
-#                 lambda d: any(
-#                     clean_plan.lower() in row.text.lower()
-#                     for row in d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-#                 )
-#             )
-#             found = True
-#         except:
-#             found = False
-
-#     print(f"✅ Plan exists: {clean_plan}" if found else f"❌ Plan NOT found: {clean_plan}")
-
-#     # Clear plan name for next iteration
-#     try:
-#         x_buttons = driver.find_elements(By.CSS_SELECTOR, "button.breadcrumb-delete-btn")
-#         if len(x_buttons) >= 2:
-#             driver.execute_script("arguments[0].click();", x_buttons[1])
-#             print("🧹 Cleared plan name (second X button).")
-#     except:
-#         pass
-#     time.sleep(0.5)
-
-
-# In[7]:
-
-
-import pandas as pd
-import time
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-
-# --- HELPER FUNCTION TO CLEAR SEARCH BAR BEFORE NEXT PLAN ---
-def clear_plan_name_only(driver, wait, retries=2):
+def click_download_for_year(driver, wait, year: str) -> bool:
     """
-    Clears the second breadcrumb X button (Plan Name) robustly.
+    Robustly find a row with year and click the download svg.
+    Handles stale element by retrying.
     """
-    for attempt in range(retries):
+    for attempt in range(3):
         try:
-            plan_name_clear_btn = wait.until(
-                EC.element_to_be_clickable((
-                    By.XPATH,
-                    "(//button[contains(@class,'breadcrumb-delete-btn')])[2]"
-                ))
-            )
-            driver.execute_script("arguments[0].scrollIntoView(true);", plan_name_clear_btn)
-            driver.execute_script("arguments[0].click();", plan_name_clear_btn)
-            print("🧹 Cleared plan name (second X button).")
-            return True
-        except TimeoutException:
-            print(f"⚠️ Attempt {attempt+1}: Plan name breadcrumb X button not clickable yet.")
-            time.sleep(0.3)
-    print("❌ Could not clear plan name after retries.")
-    return False
-
-# --- READ PLAN NAMES ---
-# excel_file = "/Users/sharonzou/f_5500_2024_all.xlsx"
-# df = pd.read_excel(excel_file, nrows=10)
-# plan_names = df['PLAN_NAME'].dropna().tolist()
-csv_file = "filtered_401k_403b_plans.csv"
-df = pd.read_csv(csv_file)
-plane_names = df["Full_Plan_Name"].dropna().tolist()
-plane_names = plane_names[:10]
-
-# --- LOOP THROUGH PLANS ---
-for plan in plan_names:
-    clean_plan = ' '.join(plan.strip().replace("\xa0", " ").split())
-    print(f"\n🔍 Searching for: {clean_plan}")
-
-    # Remove any lingering modal
-    driver.execute_script("""
-        const modal = document.querySelector('.mmodal');
-        if (modal) modal.remove();
-    """)
-
-    # --- SEARCH PLAN ---
-    search_input = wait.until(EC.element_to_be_clickable((By.ID, "search-field")))
-    search_input.clear()
-    search_input.send_keys(clean_plan)
-    driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", search_input)
-    search_input.send_keys("\n")  # ensure search triggers
-    time.sleep(0.5)  # small debounce
-
-    # Click "Go!" if visible
-    try:
-        go_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='Go!']]")))
-        driver.execute_script("arguments[0].click();", go_button)
-    except TimeoutException:
-        pass
-
-    # --- CHECK IF PLAN EXISTS ---
-    found = False
-    try:
-        WebDriverWait(driver, 10).until(
-            lambda d: any(
-                clean_plan.lower() in row.text.lower()
-                for row in d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-            )
-        )
-        found = True
-    except (TimeoutException, StaleElementReferenceException):
-        try:
-            WebDriverWait(driver, 5).until(
-                lambda d: any(
-                    clean_plan.lower() in row.text.lower()
-                    for row in d.find_elements(By.CSS_SELECTOR, "table tbody tr")
-                )
-            )
-            found = True
-        except:
-            found = False
-
-    if found:
-        print(f"✅ Plan exists: {clean_plan}")
-
-        # --- DOWNLOAD PDF FOR 2024 ---
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
-        downloaded = False
-        for row in rows:
-            cols = row.find_elements(By.TAG_NAME, "td")
-            year_text = cols[2].text.strip()
-            if "2024" in year_text:
-                try:
+            # re-fetch rows each attempt (important!)
+            rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
+            for row in rows:
+                cols = row.find_elements(By.TAG_NAME, "td")
+                if len(cols) < 3:
+                    continue
+                year_text = cols[2].text.strip()
+                if year in year_text:
                     download_btn = cols[0].find_element(By.TAG_NAME, "svg")
                     driver.execute_script("arguments[0].scrollIntoView();", download_btn)
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     driver.execute_script(
-                        "arguments[0].dispatchEvent(new Event('click', {bubbles: true}));", download_btn
+                        "arguments[0].dispatchEvent(new Event('click', {bubbles: true}));",
+                        download_btn
                     )
-                    print(f"⬇️ Download initiated for {clean_plan} (2024)")
-                    downloaded = True
-                    time.sleep(3)  # wait for download to start
-                    break
-                except Exception as e:
-                    print(f"⚠️ Could not download PDF for {clean_plan}: {e}")
-        if not downloaded:
-            print(f"⚠️ No 2024 PDF found for {clean_plan}")
+                    return True
+            return False
+        except StaleElementReferenceException:
+            print(f"⚠️ stale element while locating download row (retry {attempt+1}/3)")
+            time.sleep(0.8)
+    return False
 
-    else:
-        print(f"❌ Plan NOT found: {clean_plan}")
 
-    # --- CLEAR PLAN NAME FOR NEXT ITERATION ---
+# ---------- CONFIG ----------
+TARGET_URL = "https://www.efast.dol.gov/5500Search/"
+TARGET_YEAR = "2024"
+
+csv_file = "filtered_401k_403b_plans.csv"
+
+# 临时下载落地（为了识别“新下载的那个文件”）
+TEMP_DOWNLOAD_DIR = Path("outputs_tmp_downloads").resolve()
+TEMP_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ✅ 你要的：最终都放在 outputs/ 下面
+OUTPUT_DIR = Path("outputs").resolve()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+LIMIT = 10
+
+
+def main():
+    df = pd.read_csv(csv_file)
+    if "Full_Plan_Name" not in df.columns:
+        raise ValueError(f"Column 'Full_Plan_Name' not found in {csv_file}. Found: {df.columns.tolist()}")
+
+    plan_names = df["Full_Plan_Name"].dropna().astype(str).tolist()[:LIMIT]
+
+    # Selenium setup
+    options = webdriver.ChromeOptions()
+    options.add_argument("--start-maximized")
+    prefs = {"download.default_directory": str(TEMP_DOWNLOAD_DIR)}
+    options.add_experimental_option("prefs", prefs)
+
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+    )
+    wait = WebDriverWait(driver, 20)
+
     try:
-        search_input.clear()
-        clear_plan_name_only(driver, wait)
-        time.sleep(0.5)
-    except:
-        pass
+        driver.get(TARGET_URL)
+        close_try_later_modal(driver)
+        apply_year_filter(driver, wait, TARGET_YEAR)
+
+        for raw_plan in plan_names:
+            query = build_search_query(raw_plan)
+            plan_slug = sanitize_filename(raw_plan)
+
+            print(f"\n🔍 Searching for: {query}")
+
+            # search
+            search_input = wait.until(EC.element_to_be_clickable((By.ID, "search-field")))
+            search_input.clear()
+            search_input.send_keys(query)
+            driver.execute_script(
+                "arguments[0].dispatchEvent(new Event('input', { bubbles: true }));",
+                search_input
+            )
+            time.sleep(0.4)
+
+            try:
+                go_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[.//span[text()='Go!']]")))
+                driver.execute_script("arguments[0].click();", go_button)
+            except TimeoutException:
+                pass
+
+            # check results exist
+            try:
+                WebDriverWait(driver, 10).until(
+                    lambda d: len(d.find_elements(By.CSS_SELECTOR, "table tbody tr")) > 0
+                )
+                print(f"✅ Results exist for query: {query}")
+            except TimeoutException:
+                print(f"❌ No results returned for query: {query}")
+                cleared = clear_plan_name_only(driver, wait)
+                if not cleared:
+                    print("🔄 Refresh fallback...")
+                    driver.refresh()
+                    close_try_later_modal(driver)
+                    apply_year_filter(driver, wait, TARGET_YEAR)
+                continue
+
+            # download
+            before = list_pdfs(TEMP_DOWNLOAD_DIR)
+            clicked = click_download_for_year(driver, wait, TARGET_YEAR)
+
+            if clicked:
+                print(f"⬇️ Download clicked ({TARGET_YEAR})")
+
+                # ✅ final file goes directly under outputs/
+                target_pdf = OUTPUT_DIR / f"{plan_slug}__{TARGET_YEAR}.pdf"
+                moved = move_new_pdf(TEMP_DOWNLOAD_DIR, before, target_pdf)
+                if moved:
+                    print(f"✅ Saved -> {target_pdf}")
+                else:
+                    print("⚠️ Download not detected (maybe blocked / slow).")
+            else:
+                print(f"⚠️ No {TARGET_YEAR} row found to download for this query.")
+
+            # clear for next
+            cleared = clear_plan_name_only(driver, wait)
+            if not cleared:
+                print("🔄 Refresh fallback...")
+                driver.refresh()
+                close_try_later_modal(driver)
+                apply_year_filter(driver, wait, TARGET_YEAR)
+
+            time.sleep(0.4)
+
+    finally:
+        print("\nClosing browser...")
+        driver.quit()
 
 
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-
+if __name__ == "__main__":
+    main()
 
